@@ -1,59 +1,40 @@
 import io
-import os
 import re
 import pandas as pd
 import pdfplumber
-import pytesseract
 import streamlit as st
 
-# Windows 本機 Tesseract 預設路徑備援
-if os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe"):
-    pytesseract.pytesseract.tesseract_cmd = (
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    )
-
-st.set_page_config(page_title="PDF 提單與發票自動整理工具", layout="wide")
-st.title("📄 PDF 提單 & 發票自動轉 Excel 工具（精準雙重解析版）")
-st.caption("支援直接從發票明細與提單雙重擷取，解決掃描檔辨識問題！")
-
-LEGAL_AND_BIZ_WORDS = r"\b(Logistics|Consulting|Electronics|Transportation|Transport|Freight|Supply\s+Chain|Worldwide|International|Systems|Services|Solutions|Trading|Inc\.?|LLC\.?|Corp\.?|Corporation|Ltd\.?|Limited|Co\.?|Company|\(USA\)|\(US\))\b"
+st.set_page_config(
+    page_title="PDF 提單與發票自動整理工具", page_icon="📄", layout="wide"
+)
+st.title("📄 PDF 提單 & 發票自動轉 Excel 工具")
+st.caption(
+    "純文字極速解析版：自動過濾 REMARK 雜訊，FROM/TO 僅取第一個主詞，支援 Excel 累加！"
+)
 
 
-def clean_company_name(raw_name):
-    """去除公司名中的地址數字、法律後綴與物流冗贅詞，只留核心品牌名"""
-    if not raw_name:
+def get_first_word(text):
+    """只抓取第一個主要單詞（過濾標點與數字門牌）"""
+    if not text:
         return ""
-    # 去除前後數字門牌（例如 601 Delta 或 Delta 601）
-    name = re.sub(r"^\d+\s*", "", raw_name.strip())
-    name = re.sub(r"\s*\d+$", "", name.strip())
-    name = re.sub(r"\(.*?\)", "", name)
-    name = re.sub(r"[,，\.\-_/]", " ", name)
-    name = re.sub(LEGAL_AND_BIZ_WORDS, "", name, flags=re.IGNORECASE)
-    words = name.strip().split()
-    return " ".join(words) if words else raw_name.strip()
-
-
-def extract_all_text(file_bytes):
-    """提取純文字 + 掃描頁強制 OCR"""
-    full_text_list = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            txt = page.extract_text() or ""
-            full_text_list.append(txt)
-            # 如果頁面文字很少，或者是提單頁面，進行 OCR
-            if len(txt.strip()) < 50 or "LADING" in txt.upper():
-                try:
-                    img = page.to_image(resolution=300).original
-                    ocr_txt = pytesseract.image_to_string(img, lang="eng")
-                    if ocr_txt:
-                        full_text_list.append(ocr_txt)
-                except Exception:
-                    pass
-    return "\n".join(full_text_list)
+    # 去除前後標點與數字
+    cleaned = re.sub(r"^[\d\W]+", "", text.strip())
+    # 切割取第一個單詞
+    words = cleaned.split()
+    if words:
+        # 如果第一個字剛好是常見品牌詞，直接回傳
+        return words[0].strip()
+    return ""
 
 
 def parse_pdf(file_bytes):
-    full_text = extract_all_text(file_bytes)
+    """解析單一 PDF 全文純文字"""
+    full_text = ""
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                full_text += t + "\n"
 
     # 1. INVOICE NUMBER
     inv_match = re.search(
@@ -61,7 +42,7 @@ def parse_pdf(file_bytes):
     )
     invoice_number = inv_match.group(1).strip() if inv_match else ""
 
-    # 2. FREIGHT AMOUNT
+    # 2. FREIGHT AMOUNT (Total 後面的金額)
     amount_match = re.search(
         r"Total\s*\$?\s*([0-9,]+\.[0-9]{2})", full_text, re.IGNORECASE
     )
@@ -77,49 +58,52 @@ def parse_pdf(file_bytes):
     )
     invoice_date = date_match.group(1).strip() if date_match else ""
 
-    # 4. MATERIAL (SKU#)
+    # 4. MATERIAL (SKU)
     sku_match = re.search(
         r"SKU#?\s*([A-Za-z0-9\-]+)", full_text, re.IGNORECASE
     ) or re.search(r"(CLSAC[A-Za-z0-9\-]+)", full_text, re.IGNORECASE)
     material = sku_match.group(1).strip() if sku_match else ""
 
-    # 5. REMARK (只抓純代碼 PSDELT260902005)
+    # 5. REMARK (只精準抓 PO 號碼本體，去掉後面的 Inbound&Freight 雜訊)
     po_match = re.search(
         r"PO#?[:：]?\s*([A-Za-z0-9]{6,})", full_text, re.IGNORECASE
     )
     po_code = po_match.group(1).strip() if po_match else ""
     remark = f"PO#: {po_code}" if po_code else ""
 
-    # ================= 6 & 7. FROM 與 TO 雙重解析 =================
+    # ================= 6. FROM (只抓第一個字) =================
     from_val = ""
-    to_val = ""
-
-    # 【策略 A】：直接從發票的 Description 抓（最精準！例如：from 601 Delta ... to 1991 Peak Smart）
+    # 優先從發票明細抓 "from ... to ..."
     route_match = re.search(
-        r"from\s+(?:\d+\s+)?([A-Za-z\s]+?)(?:,|\s+Plano|\s+Lewisville|\s+to|\n|$)\s+to\s+(?:\d+\s+)?([A-Za-z\s]+?)(?:\s+on|\s+Dock|\n|$)",
+        r"from\s+(.*?)\s+to\s+(.*?)(?:\s+on|\s+Dock|\n|$)",
         full_text,
         re.IGNORECASE,
     )
     if route_match:
-        from_val = clean_company_name(route_match.group(1))
-        to_val = clean_company_name(route_match.group(2))
-
-    # 【策略 B】：若策略 A 未命中，從提單區塊抓取
-    if not from_val:
+        from_val = get_first_word(route_match.group(1))
+    else:
+        # 備援：從 SHIP FROM Name 抓
         sf_match = re.search(
-            r"SHIP\s*FROM[\s\S]*?Name[:：]?\s*([^\n\r]+)", full_text, re.IGNORECASE
+            r"SHIP\s*FROM[\s\S]*?Name[:：]?\s*([^\n\r]+)",
+            full_text,
+            re.IGNORECASE,
         )
         if sf_match:
-            from_val = clean_company_name(sf_match.group(1))
+            from_val = get_first_word(sf_match.group(1))
 
-    if not to_val:
+    # ================= 7. TO (只抓第一個字) =================
+    to_val = ""
+    if route_match:
+        to_val = get_first_word(route_match.group(2))
+    else:
+        # 備援：從 DELIVERY TO Name 抓
         dt_match = re.search(
             r"DELIVERY\s*TO[\s\S]*?Name[:：]?\s*([^\n\r]+)",
             full_text,
             re.IGNORECASE,
         )
         if dt_match:
-            to_val = clean_company_name(dt_match.group(1))
+            to_val = get_first_word(dt_match.group(1))
 
     return {
         "date": "",
@@ -135,21 +119,21 @@ def parse_pdf(file_bytes):
     }
 
 
-# ==================== 介面呈現 ====================
+# ==================== 畫面介面 ====================
 col1, col2 = st.columns(2)
 
 with col1:
     st.markdown("### 步驟 1：(選填) 上傳現有的 Excel 檔案")
     existing_file = st.file_uploader(
-        "如果有先前已經整理好的 Excel 想要累加，請在此上傳",
+        "若要將資料接續累加至原有的 Excel，請在此上傳",
         type=["xlsx", "xls"],
         key="existing_excel",
     )
 
 with col2:
-    st.markdown("### 步驟 2：上傳這次要新增的 PDF 檔案")
+    st.markdown("### 步驟 2：上傳這次要處理的 PDF 檔案")
     uploaded_files = st.file_uploader(
-        "請選擇或拖曳 PDF 檔案至此（可多選）",
+        "請選擇或拖曳 PDF 檔案至此（支援多選）",
         type=["pdf"],
         accept_multiple_files=True,
         key="pdf_files",
@@ -166,6 +150,7 @@ if uploaded_files:
 
     new_df = pd.DataFrame(new_records)
 
+    # 合併既有 Excel
     if existing_file:
         try:
             old_df = pd.read_excel(existing_file)
@@ -175,7 +160,7 @@ if uploaded_files:
                     subset=["INVOICE NUMBER"], keep="last"
                 )
             st.success(
-                f"🎉 成功解析 {len(new_records)} 筆 PDF 資料，並已累加至原有的 Excel！目前總計 {len(final_df)} 筆。"
+                f"🎉 成功解析 {len(new_records)} 筆 PDF 資料，並已累加至原有的 Excel！目前累積共 {len(final_df)} 筆。"
             )
         except Exception as e:
             st.error(f"讀取既有 Excel 失敗: {e}")
@@ -187,7 +172,7 @@ if uploaded_files:
     st.subheader("📊 資料預覽")
     st.dataframe(final_df, use_container_width=True)
 
-    # 匯出 Excel
+    # 匯出最新 Excel
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         final_df.to_excel(writer, index=False, sheet_name="Sheet1")
