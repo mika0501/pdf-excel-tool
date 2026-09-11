@@ -1,187 +1,180 @@
-import io
+import os
 import re
 import pandas as pd
 import pdfplumber
-import streamlit as st
-
-st.set_page_config(
-    page_title="PDF 提單與發票自動整理工具", page_icon="📄", layout="wide"
+from flask import (
+    Flask,
+    flash,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    url_for,
 )
-st.title("📄 PDF 提單 & 發票自動轉 Excel 工具")
-st.caption(
-    "純文字極速解析版：自動過濾 REMARK 雜訊，FROM/TO 僅取第一個主詞，支援 Excel 累加！"
-)
+from werkzeug.utils import secure_filename
+
+app = Flask(__name__)
+app.secret_key = "secret_key_for_invoice_parser"
+
+UPLOAD_FOLDER = "uploads"
+OUTPUT_FOLDER = "outputs"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 
-def get_first_word(text):
-    """只抓取第一個主要單詞（過濾標點與數字門牌）"""
-    if not text:
-        return ""
-    # 去除前後標點與數字
-    cleaned = re.sub(r"^[\d\W]+", "", text.strip())
-    # 切割取第一個單詞
-    words = cleaned.split()
-    if words:
-        # 如果第一個字剛好是常見品牌詞，直接回傳
-        return words[0].strip()
-    return ""
-
-
-def parse_pdf(file_bytes):
-    """解析單一 PDF 全文純文字"""
+def parse_pdf(pdf_path):
     full_text = ""
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+    with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                full_text += t + "\n"
+            text = page.extract_text()
+            if text:
+                full_text += text + "\n"
 
-    # 1. INVOICE NUMBER
-    inv_match = re.search(
-        r"Invoice\s*no\.?[:：]?\s*([A-Za-z0-9\-]+)", full_text, re.IGNORECASE
+    # 1. Invoice No. (例如: Invoice no. : 10161)
+    inv_no_match = re.search(
+        r"Invoice\s*no\.?\s*[:：]?\s*([A-Za-z0-9\-]+)", full_text, re.IGNORECASE
     )
-    invoice_number = inv_match.group(1).strip() if inv_match else ""
+    invoice_no = inv_no_match.group(1).strip() if inv_no_match else ""
 
-    # 2. FREIGHT AMOUNT (Total 後面的金額)
-    amount_match = re.search(
-        r"Total\s*\$?\s*([0-9,]+\.[0-9]{2})", full_text, re.IGNORECASE
-    )
-    freight_amount = (
-        f"${amount_match.group(1).strip()}" if amount_match else ""
-    )
-
-    # 3. INVOICE DATE
+    # 2. Invoice Date (例如: Invoice date: 09/08/2026)
     date_match = re.search(
-        r"Invoice\s*date[:：]?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})",
+        r"Invoice\s*date\s*[:：]?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})",
         full_text,
         re.IGNORECASE,
     )
     invoice_date = date_match.group(1).strip() if date_match else ""
 
-    # 4. MATERIAL (SKU)
-    sku_match = re.search(
-        r"SKU#?\s*([A-Za-z0-9\-]+)", full_text, re.IGNORECASE
-    ) or re.search(r"(CLSAC[A-Za-z0-9\-]+)", full_text, re.IGNORECASE)
-    material = sku_match.group(1).strip() if sku_match else ""
-
-    # 5. REMARK (只精準抓 PO 號碼本體，去掉後面的 Inbound&Freight 雜訊)
+    # 3. PO Number (例如: PO#: PSDELT260902005)
     po_match = re.search(
-        r"PO#?[:：]?\s*([A-Za-z0-9]{6,})", full_text, re.IGNORECASE
+        r"PO\s*#?\s*[:：]?\s*([A-Za-z0-9\-]+)", full_text, re.IGNORECASE
     )
-    po_code = po_match.group(1).strip() if po_match else ""
-    remark = f"PO#: {po_code}" if po_code else ""
+    po_number = po_match.group(1).strip() if po_match else ""
 
-    # ================= 6. FROM (只抓第一個字) =================
+    # 4. Total Amount (例如: Total $800.00)
+    total_match = re.search(r"Total\s*[\$]?\s*([0-9,]+\.[0-9]{2})", full_text)
+    total_amount = total_match.group(1).strip() if total_match else ""
+
+    # 5. SKU (例如: SKU# OLSAC504AA400-001)
+    sku_match = re.search(
+        r"SKU\s*#?\s*[:：]?\s*([A-Za-z0-9\-]+)", full_text, re.IGNORECASE
+    )
+    sku = sku_match.group(1).strip() if sku_match else ""
+
+    # 6 & 7. FROM & TO（紅色螢光筆部分）
+    # 對應文字格式: "... from 601 Delta Plano to 1991 Peak Smart on 9/3/2026 ..."
     from_val = ""
-    # 優先從發票明細抓 "from ... to ..."
+    to_val = ""
+
+    # 第一種邏輯：容許中間有或沒有 Plano，直接抓取完整標記字串
     route_match = re.search(
-        r"from\s+(.*?)\s+to\s+(.*?)(?:\s+on|\s+Dock|\n|$)",
+        r"from\s+(.*?)\s+(?:Plano\s+)?to\s+(.*?)(?:\s+on|\s+Dock|\n|$)",
         full_text,
         re.IGNORECASE,
     )
-    if route_match:
-        from_val = get_first_word(route_match.group(1))
-    else:
-        # 備援：從 SHIP FROM Name 抓
-        sf_match = re.search(
-            r"SHIP\s*FROM[\s\S]*?Name[:：]?\s*([^\n\r]+)",
-            full_text,
-            re.IGNORECASE,
-        )
-        if sf_match:
-            from_val = get_first_word(sf_match.group(1))
 
-    # ================= 7. TO (只抓第一個字) =================
-    to_val = ""
     if route_match:
-        to_val = get_first_word(route_match.group(2))
+        from_val = route_match.group(1).strip()  # 結果為: 601 Delta
+        to_val = route_match.group(2).strip()  # 結果為: 1991 Peak Smart
     else:
-        # 備援：從 DELIVERY TO Name 抓
-        dt_match = re.search(
-            r"DELIVERY\s*TO[\s\S]*?Name[:：]?\s*([^\n\r]+)",
+        # 備援規則：若沒有寫在一行內，嘗試分開比對
+        from_alt = re.search(
+            r"from\s+([0-9]+\s+[A-Za-z]+)", full_text, re.IGNORECASE
+        )
+        to_alt = re.search(
+            r"to\s+([0-9]+\s+[A-Za-z\s]+?)(?:\s+on|\n|$)",
             full_text,
             re.IGNORECASE,
         )
-        if dt_match:
-            to_val = get_first_word(dt_match.group(1))
+        if from_alt:
+            from_val = from_alt.group(1).strip()
+        if to_alt:
+            to_val = to_alt.group(1).strip()
 
     return {
-        "date": "",
-        "INVOICE NUMBER": invoice_number,
-        "FREIGHT AMOUNT": freight_amount,
-        "INVOICE DATE": invoice_date,
-        "MATERIAL": material,
-        "REMARK": remark,
-        "INBOUND": "",
-        "NOTES": "",
-        "FROM": from_val,
-        "TO": to_val,
+        "Invoice No": invoice_no,
+        "Invoice Date": invoice_date,
+        "PO Number": po_number,
+        "From": from_val,
+        "To": to_val,
+        "SKU": sku,
+        "Total Amount": total_amount,
     }
 
 
-# ==================== 畫面介面 ====================
-col1, col2 = st.columns(2)
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        if "files" not in request.files:
+            flash("請選擇檔案")
+            return redirect(request.url)
 
-with col1:
-    st.markdown("### 步驟 1：(選填) 上傳現有的 Excel 檔案")
-    existing_file = st.file_uploader(
-        "若要將資料接續累加至原有的 Excel，請在此上傳",
-        type=["xlsx", "xls"],
-        key="existing_excel",
-    )
+        files = request.files.getlist("files")
+        if not files or files[0].filename == "":
+            flash("未選擇任何檔案")
+            return redirect(request.url)
 
-with col2:
-    st.markdown("### 步驟 2：上傳這次要處理的 PDF 檔案")
-    uploaded_files = st.file_uploader(
-        "請選擇或拖曳 PDF 檔案至此（支援多選）",
-        type=["pdf"],
-        accept_multiple_files=True,
-        key="pdf_files",
-    )
+        data_list = []
+        for file in files:
+            if file and file.filename.lower().endswith(".pdf"):
+                filename = secure_filename(file.filename)
+                filepath = os.path.join(UPLOAD_FOLDER, filename)
+                file.save(filepath)
 
-if uploaded_files:
-    new_records = []
-    progress_bar = st.progress(0)
+                try:
+                    res = parse_pdf(filepath)
+                    res["Filename"] = filename
+                    data_list.append(res)
+                except Exception as e:
+                    print(f"處理檔案 {filename} 時出錯: {e}")
 
-    for i, file in enumerate(uploaded_files):
-        data = parse_pdf(file.read())
-        new_records.append(data)
-        progress_bar.progress((i + 1) / len(uploaded_files))
+        if not data_list:
+            flash("未能成功解析上傳的 PDF 檔案")
+            return redirect(request.url)
 
-    new_df = pd.DataFrame(new_records)
+        # 匯出為 Excel
+        df = pd.DataFrame(data_list)
+        # 調整欄位顯示順序
+        columns_order = [
+            "Filename",
+            "Invoice No",
+            "Invoice Date",
+            "PO Number",
+            "From",
+            "To",
+            "SKU",
+            "Total Amount",
+        ]
+        df = df.reindex(columns=columns_order)
 
-    # 合併既有 Excel
-    if existing_file:
-        try:
-            old_df = pd.read_excel(existing_file)
-            final_df = pd.concat([old_df, new_df], ignore_index=True)
-            if "INVOICE NUMBER" in final_df.columns:
-                final_df = final_df.drop_duplicates(
-                    subset=["INVOICE NUMBER"], keep="last"
-                )
-            st.success(
-                f"🎉 成功解析 {len(new_records)} 筆 PDF 資料，並已累加至原有的 Excel！目前累積共 {len(final_df)} 筆。"
-            )
-        except Exception as e:
-            st.error(f"讀取既有 Excel 失敗: {e}")
-            final_df = new_df
-    else:
-        final_df = new_df
-        st.success(f"🎉 成功解析 {len(new_records)} 筆 PDF 資料！")
+        output_excel = os.path.join(OUTPUT_FOLDER, "invoices_parsed.xlsx")
+        df.to_excel(output_excel, index=False)
 
-    st.subheader("📊 資料預覽")
-    st.dataframe(final_df, use_container_width=True)
+        return send_file(output_excel, as_attachment=True)
 
-    # 匯出最新 Excel
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        final_df.to_excel(writer, index=False, sheet_name="Sheet1")
-    excel_data = output.getvalue()
+    return """
+    <!doctype html>
+    <html>
+    <head>
+        <title>Invoice PDF 自動擷取工具</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 50px auto; max-width: 600px; text-align: center; }
+            .drop-zone { border: 2px dashed #007bff; padding: 40px; border-radius: 8px; margin-bottom: 20px; }
+            input[type="submit"] { background: #007bff; color: white; border: none; padding: 10px 20px; font-size: 16px; border-radius: 5px; cursor: pointer; }
+            input[type="submit"]:hover { background: #0056b3; }
+        </style>
+    </head>
+    <body>
+        <h2>上傳發票 PDF（支援多檔批次處理）</h2>
+        <form method="post" enctype="multipart/form-data">
+            <div class="drop-zone">
+                <input type="file" name="files" multiple accept=".pdf">
+            </div>
+            <input type="submit" value="開始解析並下載 Excel">
+        </form>
+    </body>
+    </html>
+    """
 
-    st.download_button(
-        label="📥 下載整理好的最新 Excel 檔案 (.xlsx)",
-        data=excel_data,
-        file_name="整理結果_最新累加.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
